@@ -1,0 +1,5 @@
+/q3playground
+*.core
+*.swp
+*.log
+/pak*
