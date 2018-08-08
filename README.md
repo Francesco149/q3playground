@@ -7,9 +7,13 @@ dependencies: libGL, libGLU, SDL2
 should be compatible at least with x86/x86\_64 windows, linux, freebsd
 with gcc, clang, msvc
 
-I might or might not add more features in the future, for now it just
-renders the map's meshes with vertex lighting. I definitely want to
-try and implement quake-like physics and collisions
+I might or might not add more features in the future, for now I have:
+
+* rendering meshes and patches
+* vertex lighting
+* collision detection with brushes (no patches aka curved surfaces yet)
+
+I want to at least implement physics and maybe collisions with patches
 
 # compiling
 just run ```./build``` . it's aware of ```CC```, ```CFLAGS```,
@@ -44,3 +48,5 @@ refer to the attached UNLICENSE or http://unlicense.org/
 * unofficial bsp format spec: http://www.mralligator.com/q3/
 * tessellation implementation:
   http://graphics.cs.brown.edu/games/quake/quake3.html
+* collision detection:
+  https://web.archive.org/web/20041206085743/http://www.nathanostgard.com:80/tutorials/quake3/collision/

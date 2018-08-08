@@ -8,9 +8,13 @@
  * should be compatible at least with x86/x86\_64 windows, linux, freebsd
  * with gcc, clang, msvc
  *
- * I might or might not add more features in the future, for now it just
- * renders the map's meshes with vertex lighting. I definitely want to
- * try and implement quake-like physics and collisions
+ * I might or might not add more features in the future, for now I have:
+ *
+ * * rendering meshes and patches
+ * * vertex lighting
+ * * collision detection with brushes (no patches aka curved surfaces yet)
+ *
+ * I want to at least implement physics and maybe collisions with patches
  *
  * # compiling
  * just run ```./build``` . it's aware of ```CC```, ```CFLAGS```,
@@ -45,12 +49,18 @@
  * * unofficial bsp format spec: http://www.mralligator.com/q3/
  * * tessellation implementation:
  *   http://graphics.cs.brown.edu/games/quake/quake3.html
+ * * collision detection:
+ *   https://web.archive.org/web/20041206085743/http://www.nathanostgard.com:80/tutorials/quake3/collision/
  */
 
 #include <SDL2/SDL.h>
 
 #define degrees(rad) ((rad) * (180.0f / M_PI))
 #define radians(deg) ((deg) * (M_PI / 180.0f))
+#define eq3(a, b) \
+    ((a)[0] == (b)[0] && (a)[1] == (b)[1] && (a)[2] == (b)[2])
+#define clr3(a) ((a)[0] = 0, (a)[1] = 0, (a)[2] = 0)
+#define cpy3(a, b) ((a)[0] = (b)[0], (a)[1] = (b)[1], (a)[2] = (b)[2])
 #define dot3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
 #define add2(a, b) ((a)[0] += (b)[0], (a)[1] += (b)[1])
 #define add3(a, b) ((a)[0] += (b)[0], (a)[1] += (b)[1], (a)[2] += (b)[2])
@@ -362,6 +372,12 @@ struct bsp_header
     struct bsp_dirent dirents[17];
 });
 
+enum bsp_contents
+{
+    CONTENTS_SOLID = 1,
+    LAST_CONTENTS
+};
+
 packed(
 struct bsp_texture
 {
@@ -381,8 +397,7 @@ packed(
 struct bsp_node
 {
     int plane;
-    int front;
-    int back;
+    int child[2]; /* front, back */
     int mins[3];
     int maxs[3];
 });
@@ -631,9 +646,9 @@ int bsp_find_leaf(struct bsp_file* file, float* camera_pos)
         distance = dot3(camera_pos, plane->normal) - plane->dist;
 
         if (distance >= 0) {
-            index = node->front;
+            index = node->child[0];
         } else {
-            index = node->back;
+            index = node->child[1];
         }
     }
 
@@ -895,6 +910,23 @@ int* visible_faces;
 unsigned char* visible_faces_mask;
 struct patch** patches;
 
+enum plane_type
+{
+    PLANE_X,
+    PLANE_Y,
+    PLANE_Z,
+    PLANE_NONAXIAL,
+    LAST_PLANE_TYPE
+};
+
+struct plane
+{
+    int signbits;
+    int type;
+};
+
+struct plane* planes;
+
 int tessellation_level;
 float camera_pos[3];
 float camera_angle[2]; /* yaw, pitch */
@@ -1141,6 +1173,399 @@ void tessellate_face(int face_index)
     }
 }
 
+#define SURF_CLIP_EPSILON 0.125f
+
+enum tw_flags
+{
+    TW_STARTS_OUT = 1<<1,
+    TW_ENDS_OUT = 1<<2,
+    TW_ALL_SOLID = 1<<3,
+    TW_LAST_FLAG
+};
+
+struct trace_work
+{
+    float start[3];
+    float end[3];
+    float endpos[3];
+    float frac;
+    int flags;
+    float mins[3];
+    float maxs[3];
+    float offsets[8][3];
+};
+
+/*
+ * - adjust plane dist to account for the bounding box
+ * - if both points are in front of the plane, we're done with this brush
+ * - if both points are behind the plane, we continue looping expecting
+ *   other planes to clip us
+ * - if we are entering the brush, clip start_frac to the distance
+ *   between the starting point and the brush minus the epsilon so we don't
+ *   actually touch
+ * - if we are exiting the brush, clip end_frac to the distance between
+ *   the starting point and the brush plus the epsilon so we don't
+ *   actually touch
+ * - keep collecting the maximum start_frac and minimum end_faction so
+ *   we get as close as possible to touching the brush but not quite
+ * - store the minimum start_frac out of all the brushes so we
+ *   clip against the closest brush
+ * - if the trace starts and ends inside the brush, negate the move
+ *
+ * (I assume this means that the brush sides are sorted from back to front)
+ */
+
+void trace_brush(struct trace_work* work, struct bsp_brush* brush)
+{
+    int i;
+    float start_frac;
+    float end_frac;
+
+    /* TODO: do optimized check for the first 6 planes which are axial */
+
+    start_frac = -1;
+    end_frac = 1;
+
+    for (i = 0; i < brush->n_brushsides; ++i)
+    {
+        int side_index;
+        int plane_index;
+        struct bsp_plane* plane;
+        int signbits;
+
+        float dist;
+        float start_distance, end_distance;
+        float frac;
+
+        side_index = brush->brushside + i;
+        plane_index = map.brushsides[side_index].plane;
+        plane = &map.planes[plane_index];
+        signbits = planes[plane_index].signbits;
+
+        dist = plane->dist - dot3(work->offsets[signbits], plane->normal);
+
+        start_distance = dot3(work->start, plane->normal) - dist;
+        end_distance = dot3(work->end, plane->normal) - dist;
+
+        if (start_distance > 0) {
+            work->flags |= TW_STARTS_OUT;
+        }
+
+        if (end_distance > 0) {
+            work->flags |= TW_ENDS_OUT;
+        }
+
+        if (start_distance > 0 &&
+            (end_distance >= SURF_CLIP_EPSILON ||
+             end_distance >= start_distance))
+        {
+            return;
+        }
+
+        if (start_distance <= 0 && end_distance <= 0) {
+            continue;
+        }
+
+        if (start_distance > end_distance)
+        {
+            frac = (start_distance - SURF_CLIP_EPSILON) /
+                (start_distance - end_distance);
+
+            start_frac = SDL_max(start_frac, frac);
+        }
+
+        else
+        {
+            frac = (start_distance + SURF_CLIP_EPSILON) /
+                (start_distance - end_distance);
+
+            end_frac = SDL_min(end_frac, frac);
+        }
+    }
+
+    if (start_frac < end_frac &&
+        start_frac > -1 && start_frac < work->frac)
+    {
+        work->frac = SDL_max(start_frac, 0);
+    }
+
+    if (!(work->flags & (TW_STARTS_OUT | TW_ENDS_OUT))) {
+        work->frac = 0;
+    }
+}
+
+/*
+ * - for leaves, only trace brush if the contents are solid and the brush
+ *   has sides
+ * - for nodes, recurse into front/back if both start and end are in front
+ *   of, or behind the node's plane
+ * - if start -> end crosses over two nodes, we need to recurse into both
+ *   nodes and split the start -> end segment into two segment that are
+ *   just short of crossing over by adding SURFACE_CLIP_EPSILON
+ * - planes contain an enum that can tell us if they are axis aligned.
+ *   when they are axis aligned, we can skip some calculations because
+ *   the bounding box is also axis aligned
+ */
+
+void trace_leaf(struct trace_work* work, int index)
+{
+    int i;
+    struct bsp_leaf* leaf;
+
+    leaf = &map.leaves[index];
+
+    for (i = 0; i < leaf->n_leafbrushes; ++i)
+    {
+        struct bsp_brush* brush;
+        int contents;
+        int brush_index;
+
+        brush_index = map.leafbrushes[leaf->leafbrush + i];
+        brush = &map.brushes[brush_index];
+        contents = map.textures[brush->texture].contents;
+
+        if (brush->n_brushsides && (contents & CONTENTS_SOLID))
+        {
+            trace_brush(work, brush);
+
+            if (!work->frac) {
+                return;
+            }
+        }
+    }
+
+    /* TODO: collision with patches */
+}
+
+void trace_node(struct trace_work* work, int index, float start_frac,
+    float end_frac, float* start, float* end)
+{
+    int i;
+    struct bsp_node* node;
+    struct bsp_plane* plane;
+    int plane_type;
+
+    float start_distance;
+    float end_distance;
+    float offset;
+
+    int side;
+    float idistance;
+    float frac1;
+    float frac2;
+    float mid_frac;
+    float mid[3];
+
+    if (index < 0) {
+        trace_leaf(work, (-index) - 1);
+        return;
+    }
+
+    node = &map.nodes[index];
+    plane = &map.planes[node->plane];
+    plane_type = planes[node->plane].type;
+
+    if (plane_type < 3)
+    {
+        start_distance = start[plane_type] - plane->dist;
+        end_distance = end[plane_type] - plane->dist;
+        offset = work->maxs[plane_type];
+    }
+    else
+    {
+        start_distance = dot3(start, plane->normal) - plane->dist;
+        end_distance = dot3(end, plane->normal) - plane->dist;
+
+        if (eq3(work->mins, work->maxs)) {
+            offset = 0;
+        } else {
+            /* "this is silly" - id Software */
+            offset = 2048;
+        }
+    }
+
+    if (start_distance >= offset + 1 && end_distance >= offset + 1) {
+        trace_node(work, node->child[0], start_frac, end_frac, start, end);
+        return;
+    }
+
+    if (start_distance < -offset - 1 && end_distance < -offset - 1) {
+        trace_node(work, node->child[1], start_frac, end_frac, start, end);
+        return;
+    }
+
+    if (start_distance < end_distance)
+    {
+        side = 1;
+        idistance = 1.0f / (start_distance - end_distance);
+        frac1 = (start_distance - offset + SURF_CLIP_EPSILON) * idistance;
+        frac2 = (start_distance + offset + SURF_CLIP_EPSILON) * idistance;
+    }
+
+    else if (start_distance > end_distance)
+    {
+        side = 0;
+        idistance = 1.0f / (start_distance - end_distance);
+        frac1 = (start_distance + offset + SURF_CLIP_EPSILON) * idistance;
+        frac2 = (start_distance - offset - SURF_CLIP_EPSILON) * idistance;
+    }
+
+    else
+    {
+        side = 0;
+        frac1 = 1;
+        frac2 = 0;
+    }
+
+    frac1 = SDL_max(0, SDL_min(1, frac1));
+    frac2 = SDL_max(0, SDL_min(1, frac2));
+
+    mid_frac = start_frac + (end_frac - start_frac) * frac1;
+
+    for (i = 0; i < 3; ++i) {
+        mid[i] = start[i] + (end[i] - start[i]) * frac1;
+    }
+
+    trace_node(work, node->child[side], start_frac, mid_frac, start, mid);
+
+    mid_frac = start_frac + (end_frac - start_frac) * frac2;
+
+    for (i = 0; i < 3; ++i) {
+        mid[i] = start[i] + (end[i] - start[i]) * frac2;
+    }
+
+    trace_node(work, node->child[side^1], mid_frac, end_frac, mid, end);
+}
+
+/*
+ * - adjust bounding box so it's symmetric. this is simply done by finding
+ *   the middle point and moving start/end to align with it
+ * - initialize offsets. this is a lookup table for mins/maxs with any
+ *   sign combination for the plane's normal. it ensures that we account
+ *   for the hitbox in the right orientation in trace_brush
+ * - do the tracing
+ * - if we hit anything, calculate end from the unmodified start/end
+ */
+
+void trace(struct trace_work* work, float* start, float* end, float* mins,
+    float* maxs)
+{
+    int i;
+
+    work->frac = 1;
+    work->flags = 0;
+
+    for (i = 0; i < 3; ++i)
+    {
+        float offset;
+
+        offset = (mins[i] + maxs[i]) * 0.5f;
+        work->mins[i] = mins[i] - offset;
+        work->maxs[i] = maxs[i] - offset;
+        work->start[i] = start[i] + offset;
+        work->end[i] = end[i] + offset;
+    }
+
+    work->offsets[0][0] = work->mins[0];
+    work->offsets[0][1] = work->mins[1];
+    work->offsets[0][2] = work->mins[2];
+
+    work->offsets[1][0] = work->maxs[0];
+    work->offsets[1][1] = work->mins[1];
+    work->offsets[1][2] = work->mins[2];
+
+    work->offsets[2][0] = work->mins[0];
+    work->offsets[2][1] = work->maxs[1];
+    work->offsets[2][2] = work->mins[2];
+
+    work->offsets[3][0] = work->maxs[0];
+    work->offsets[3][1] = work->maxs[1];
+    work->offsets[3][2] = work->mins[2];
+
+    work->offsets[4][0] = work->mins[0];
+    work->offsets[4][1] = work->mins[1];
+    work->offsets[4][2] = work->maxs[2];
+
+    work->offsets[5][0] = work->maxs[0];
+    work->offsets[5][1] = work->mins[1];
+    work->offsets[5][2] = work->maxs[2];
+
+    work->offsets[6][0] = work->mins[0];
+    work->offsets[6][1] = work->maxs[1];
+    work->offsets[6][2] = work->maxs[2];
+
+    work->offsets[7][0] = work->maxs[0];
+    work->offsets[7][1] = work->maxs[1];
+    work->offsets[7][2] = work->maxs[2];
+
+    trace_node(work, 0, 0, 1, work->start, work->end);
+
+    if (work->frac == 1) {
+        cpy3(work->endpos, end);
+    } else {
+        int i;
+
+        for (i = 0; i < 3; ++i) {
+            work->endpos[i] = start[i] + work->frac * (end[i] - start[i]);
+        }
+    }
+}
+
+void trace_point(struct trace_work* work, float* start, float* end)
+{
+    float zero[3];
+
+    clr3(zero);
+    trace(work, start, end, zero, zero);
+}
+
+int plane_type_for_normal(float* normal)
+{
+    if (normal[0] == 1.0f || normal[0] == -1.0f) {
+        return PLANE_X;
+    }
+
+    if (normal[1] == 1.0f || normal[1] == -1.0f) {
+        return PLANE_Y;
+    }
+
+    if (normal[2] == 1.0f || normal[2] == -1.0f) {
+        return PLANE_Z;
+    }
+
+    return PLANE_NONAXIAL;
+}
+
+int signbits_for_normal(float* normal)
+{
+    int i;
+    int bits;
+
+    bits = 0;
+
+    for (i = 0; i < 3; ++i)
+    {
+        if (normal[i] < 0) {
+            bits |= 1<<i;
+        }
+    }
+
+    return bits;
+}
+
+void init_planes()
+{
+    int i;
+
+    planes = (struct plane*)
+        SDL_realloc(planes, map.n_planes * sizeof(struct plane));
+
+    for (i = 0; i < map.n_planes; ++i) {
+        planes[i].signbits = signbits_for_normal(map.planes[i].normal);
+        planes[i].type = plane_type_for_normal(map.planes[i].normal);
+    }
+}
+
 void init_patches()
 {
     int i;
@@ -1193,6 +1618,8 @@ void init_spawn()
         camera_pos[i] = (float)SDL_strtod(origin, &origin);
     }
 
+    camera_pos[2] += 50;
+
     log_print(lninfo, "[%f %f %f] %f degrees",
         expand3(camera_pos), degrees(camera_angle[0]));
 }
@@ -1211,6 +1638,9 @@ void init_map()
     if (!bsp_load(&map, map_file)) {
         exit(1);
     }
+
+    log_puts("preprocessing planes");
+    init_planes();
 
     log_puts("tessellating geometry");
     init_patches();
@@ -1268,6 +1698,10 @@ void update()
     float velocity[3];
     float pitch_sin, pitch_cos, yaw_sin, yaw_cos;
     float pitch_x;
+    float new_pos[3];
+    struct trace_work work;
+    static float player_mins[] = { -15, -15, -28 };
+    static float player_maxs[] = { 15, 15, 28 };
 
     update_fps();
 
@@ -1289,7 +1723,10 @@ void update()
 
     nrm3(velocity);
     mul3_scalar(velocity, 500 * delta_time);
-    add3(camera_pos, velocity);
+    cpy3(new_pos, camera_pos);
+    add3(new_pos, velocity);
+    trace(&work, camera_pos, new_pos, player_mins, player_maxs);
+    cpy3(camera_pos, work.endpos);
 }
 
 void render_mesh(struct bsp_face* face)
