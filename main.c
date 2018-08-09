@@ -13,8 +13,11 @@
  * * rendering meshes and patches
  * * vertex lighting
  * * collision detection with brushes (no patches aka curved surfaces yet)
+ * * cpm-like physics
+ * * sliding against bushes (no patches though)
  *
- * I want to at least implement physics and maybe collisions with patches
+ * the current priority is getting patches collisions and implement steps
+ * so we can actually walk up stairs
  *
  * # compiling
  * just run ```./build``` . it's aware of ```CC```, ```CFLAGS```,
@@ -37,7 +40,7 @@
  * env vblank_mode=0 q3playground /path/to/map.bsp
  * ```
  *
- * controls are WASD, mouse, numpad +/-
+ * controls are WASD, space, mouse, right click. toggle noclip with F
  *
  * run ```q3playground``` with no arguments for more info
  *
@@ -62,6 +65,12 @@
 #define clr3(a) ((a)[0] = 0, (a)[1] = 0, (a)[2] = 0)
 #define cpy3(a, b) ((a)[0] = (b)[0], (a)[1] = (b)[1], (a)[2] = (b)[2])
 #define dot3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
+#define mag3(v) (float)SDL_sqrt(dot3(v, v))
+#define cross3(a, b, dst) ( \
+    (dst)[0] = (a)[1] * (b)[2] - (a)[2] * (b)[1], \
+    (dst)[1] = (a)[2] * (b)[0] - (a)[0] * (b)[2], \
+    (dst)[2] = (a)[0] * (b)[1] - (a)[1] * (b)[0] \
+)
 #define add2(a, b) ((a)[0] += (b)[0], (a)[1] += (b)[1])
 #define add3(a, b) ((a)[0] += (b)[0], (a)[1] += (b)[1], (a)[2] += (b)[2])
 #define mul2_scalar(a, b) ((a)[0] *= b, (a)[1] *= b)
@@ -930,8 +939,37 @@ struct plane* planes;
 int tessellation_level;
 float camera_pos[3];
 float camera_angle[2]; /* yaw, pitch */
-float wishdir[3];
-int wishlook[2];
+float velocity[3];
+int noclip;
+
+int movement;
+float wishdir[3]; /* movement inputs in local player space, not unit */
+int wishlook[2]; /* look inputs in screen space, not unit */
+float* ground_normal;
+
+enum movement_bits
+{
+    MOVEMENT_JUMP = 1<<1,
+    MOVEMENT_JUMP_THIS_FRAME = 1<<2,
+    MOVEMENT_JUMPING = 1<<3,
+    LAST_MOVEMENT_BIT
+};
+
+float player_mins[] = { -15, -15, -24 };
+float player_maxs[] = { 15, 15, 32 };
+
+float cl_forwardspeed = 400;
+float cl_sidespeed = 350;
+float cl_movement_accelerate = 15;
+float cl_movement_airaccelerate = 7;
+float cl_movement_friction = 8;
+float sv_gravity = 800;
+float sv_max_speed = 320;
+float cl_stop_speed = 200;
+float cpm_air_stop_acceleration = 2.5f;
+float cpm_air_control_amount = 150;
+float cpm_strafe_acceleration = 70;
+float cpm_wish_speed = 30;
 
 void print_usage()
 {
@@ -1015,6 +1053,7 @@ void update_fps()
     while (one_second <= 0)
     {
         log_dump("d", ticks_per_second);
+        log_dump("f", mag3(velocity));
         one_second = 1;
         ticks_per_second = 0;
     }
@@ -1193,6 +1232,7 @@ struct trace_work
     float mins[3];
     float maxs[3];
     float offsets[8][3];
+    struct bsp_plane* plane;
 };
 
 /*
@@ -1220,6 +1260,7 @@ void trace_brush(struct trace_work* work, struct bsp_brush* brush)
     int i;
     float start_frac;
     float end_frac;
+    struct bsp_plane* closest_plane;
 
     /* TODO: do optimized check for the first 6 planes which are axial */
 
@@ -1247,6 +1288,11 @@ void trace_brush(struct trace_work* work, struct bsp_brush* brush)
         start_distance = dot3(work->start, plane->normal) - dist;
         end_distance = dot3(work->end, plane->normal) - dist;
 
+        /* TODO:
+         * for some reason these checks incorrectly report all solid
+         * when they shouldn't. for now I'm just ignoring them
+         */
+
         if (start_distance > 0) {
             work->flags |= TW_STARTS_OUT;
         }
@@ -1271,7 +1317,10 @@ void trace_brush(struct trace_work* work, struct bsp_brush* brush)
             frac = (start_distance - SURF_CLIP_EPSILON) /
                 (start_distance - end_distance);
 
-            start_frac = SDL_max(start_frac, frac);
+            if (frac > start_frac) {
+                start_frac = frac;
+                closest_plane = plane;
+            }
         }
 
         else
@@ -1287,6 +1336,7 @@ void trace_brush(struct trace_work* work, struct bsp_brush* brush)
         start_frac > -1 && start_frac < work->frac)
     {
         work->frac = SDL_max(start_frac, 0);
+        work->plane = closest_plane;
     }
 
     if (!(work->flags & (TW_STARTS_OUT | TW_ENDS_OUT))) {
@@ -1618,7 +1668,7 @@ void init_spawn()
         camera_pos[i] = (float)SDL_strtod(origin, &origin);
     }
 
-    camera_pos[2] += 50;
+    camera_pos[2] += 60;
 
     log_print(lninfo, "[%f %f %f] %f degrees",
         expand3(camera_pos), degrees(camera_angle[0]));
@@ -1693,40 +1743,421 @@ void clamp_angles(float* angles, int n_angles)
     }
 }
 
-void update()
+void trace_ground()
 {
-    float velocity[3];
+    float point[3];
+    struct trace_work work;
+
+    point[0] = camera_pos[0];
+    point[1] = camera_pos[1];
+    point[2] = camera_pos[2] - 0.25;
+
+    trace(&work, camera_pos, point, player_mins, player_maxs);
+
+    if (work.frac == 1 || (movement & MOVEMENT_JUMP_THIS_FRAME)) {
+        movement |= MOVEMENT_JUMPING;
+        ground_normal = 0;
+    } else {
+        movement &= ~MOVEMENT_JUMPING;
+        ground_normal = work.plane->normal;
+    }
+}
+
+void apply_jump()
+{
+    if (!(movement & MOVEMENT_JUMP)) {
+        return;
+    }
+
+    if ((movement & MOVEMENT_JUMPING) && !noclip) {
+        return;
+    }
+
+    movement |= MOVEMENT_JUMP_THIS_FRAME;
+    velocity[2] = 270;
+    movement &= ~MOVEMENT_JUMP; /* no auto bunnyhop */
+}
+
+void apply_friction()
+{
+    float speed;
+    float control;
+    float new_speed;
+
+    if (!noclip)
+    {
+        if ((movement & MOVEMENT_JUMPING) ||
+            (movement & MOVEMENT_JUMP_THIS_FRAME))
+        {
+            return;
+        }
+    }
+
+    speed = (float)SDL_sqrt(dot3(velocity, velocity));
+    if (speed < 1) {
+        velocity[0] = 0;
+        velocity[1] = 0;
+        return;
+    }
+
+    control = speed < cl_stop_speed ? cl_stop_speed : speed;
+    new_speed = speed - control * cl_movement_friction * delta_time;
+    new_speed = SDL_max(0, new_speed);
+    mul3_scalar(velocity, new_speed / speed);
+}
+
+void apply_acceleration(float* direction, float wishspeed,
+    float acceleration)
+{
+    float cur_speed;
+    float add_speed;
+    float accel_speed;
+    float amount[3];
+
+    if (!noclip && (movement & MOVEMENT_JUMPING)) {
+        wishspeed = SDL_min(cpm_wish_speed, wishspeed);
+    }
+
+    cur_speed = dot3(velocity, direction);
+    add_speed = wishspeed - cur_speed;
+
+    if (add_speed <= 0) {
+        return;
+    }
+
+    accel_speed = acceleration * delta_time * wishspeed;
+    accel_speed = SDL_min(accel_speed, add_speed);
+
+    cpy3(amount, direction);
+    mul3_scalar(amount, accel_speed);
+    add3(velocity, amount);
+}
+
+void apply_air_control(float* direction, float wishspeed)
+{
+    float zspeed;
+    float speed;
+    float dot;
+
+    if (wishdir[0] == 0 || wishspeed == 0) {
+        return;
+    }
+
+    zspeed = velocity[2];
+    velocity[2] = 0;
+    speed = mag3(velocity);
+    if (speed >= 0.0001f) {
+        div3_scalar(velocity, speed);
+    }
+    dot = dot3(velocity, direction);
+
+    if (dot > 0) {
+        /* can only change direction if we aren't trying to slow down */
+        float k;
+        float amount[3];
+
+        k = 32 * cpm_air_control_amount * dot * dot * delta_time;
+        mul3_scalar(velocity, speed);
+        cpy3(amount, direction);
+        mul3_scalar(amount, k);
+        nrm3(velocity);
+    }
+
+    mul3_scalar(velocity, speed);
+    velocity[2] = zspeed;
+}
+
+void apply_inputs()
+{
+    float direction[3];
     float pitch_sin, pitch_cos, yaw_sin, yaw_cos;
     float pitch_x;
-    float new_pos[3];
-    struct trace_work work;
-    static float player_mins[] = { -15, -15, -28 };
-    static float player_maxs[] = { 15, 15, 28 };
+    float wishspeed;
+    float selected_acceleration;
+    float base_wishspeed;
 
-    update_fps();
-
-    SDL_GetRelativeMouseState(&wishlook[0], &wishlook[1]);
+    /* camera look */
     camera_angle[0] += 0.002f * wishlook[0];
     camera_angle[1] += 0.002f * wishlook[1];
     clamp_angles(camera_angle, 2);
 
-    pitch_sin = SDL_sinf(2*M_PI - camera_angle[1]);
-    pitch_cos = SDL_cosf(2*M_PI - camera_angle[1]);
+    if (noclip) {
+        pitch_sin = SDL_sinf(2*M_PI - camera_angle[1]);
+        pitch_cos = SDL_cosf(2*M_PI - camera_angle[1]);
+    } else {
+        pitch_sin = 0;
+        pitch_cos = 1;
+    }
+
     yaw_sin = SDL_sinf(2*M_PI - camera_angle[0]);
     yaw_cos = SDL_cosf(2*M_PI - camera_angle[0]);
 
     /* this applies 2 rotations, pitch first then yaw */
     pitch_x = wishdir[0] * pitch_cos + wishdir[2] * (-pitch_sin);
-    velocity[0] = pitch_x * yaw_cos + wishdir[1] * (-yaw_sin);
-    velocity[1] = pitch_x * yaw_sin + wishdir[1] * yaw_cos;
-    velocity[2] = wishdir[0] * pitch_sin + wishdir[2] * pitch_cos;
+    direction[0] = pitch_x * yaw_cos + wishdir[1] * (-yaw_sin);
+    direction[1] = pitch_x * yaw_sin + wishdir[1] * yaw_cos;
+    direction[2] = wishdir[0] * pitch_sin + wishdir[2] * pitch_cos;
 
-    nrm3(velocity);
-    mul3_scalar(velocity, 500 * delta_time);
-    cpy3(new_pos, camera_pos);
-    add3(new_pos, velocity);
-    trace(&work, camera_pos, new_pos, player_mins, player_maxs);
-    cpy3(camera_pos, work.endpos);
+    /* movement */
+    wishspeed = (float)SDL_sqrt(dot3(direction, direction));
+    if (wishspeed >= 0.0001f) {
+        div3_scalar(direction, wishspeed);
+    }
+    wishspeed = SDL_min(wishspeed, sv_max_speed);
+
+    apply_jump();
+    apply_friction();
+
+    selected_acceleration = cl_movement_accelerate;
+    base_wishspeed = wishspeed;
+
+    /* cpm air acceleration | TODO: pull this out */
+    if (noclip || (movement & MOVEMENT_JUMPING) ||
+        (movement & MOVEMENT_JUMP_THIS_FRAME))
+    {
+        if (dot3(velocity, direction) < 0) {
+            selected_acceleration = cpm_air_stop_acceleration;
+        } else {
+            selected_acceleration = cl_movement_airaccelerate;
+        }
+
+        if (wishdir[1] != 0 && wishdir[0] == 0) {
+            wishspeed = SDL_min(wishspeed, cpm_wish_speed);
+            selected_acceleration = cpm_strafe_acceleration;
+        }
+    }
+
+    apply_acceleration(direction, wishspeed, selected_acceleration);
+    apply_air_control(direction, base_wishspeed);
+}
+
+void clip_velocity(float* in, float* normal, float* out, float overbounce)
+{
+    float backoff;
+    int i;
+
+    backoff = dot3(in, normal);
+
+    if (backoff < 0) {
+        backoff *= overbounce;
+    } else {
+        backoff /= overbounce;
+    }
+
+    for (i = 0; i < 3; ++i)
+    {
+        float change;
+
+        change = normal[i] * backoff;
+        out[i] = in[i] - change;
+    }
+}
+
+/*
+ * clip the velocity against all brushes until we stop colliding. this
+ * allows the player to slide against walls and the floor
+ */
+
+#define OVERCLIP 1.001f
+#define MAX_CLIP_PLANES 5
+
+int slide(int gravity)
+{
+    float end_velocity[3];
+    float planes[MAX_CLIP_PLANES][3];
+    int n_planes;
+    float time_left;
+    int n_bumps;
+    float end[3];
+
+    n_planes = 0;
+    time_left = delta_time;
+
+    if (gravity)
+    {
+        cpy3(end_velocity, velocity);
+        end_velocity[2] -= sv_gravity * delta_time;
+
+        /*
+         * not 100% sure why this is necessary, maybe to avoid tunneling
+         * through the floor when really close to it
+         */
+
+        velocity[2] = (end_velocity[2] + velocity[2]) * 0.5f;
+
+        /* slide against floor */
+        if (ground_normal) {
+            clip_velocity(velocity, ground_normal, velocity, OVERCLIP);
+        }
+    }
+
+    if (ground_normal) {
+        cpy3(planes[n_planes], ground_normal);
+        ++n_planes;
+    }
+
+    cpy3(planes[n_planes], velocity);
+    nrm3(planes[n_planes]);
+    ++n_planes;
+
+    for (n_bumps = 0; n_bumps < 4; ++n_bumps)
+    {
+        struct trace_work work;
+        int i;
+
+        /* calculate future position and attempt the move */
+        cpy3(end, velocity);
+        mul3_scalar(end, time_left);
+        add3(end, camera_pos);
+        trace(&work, camera_pos, end, player_mins, player_maxs);
+
+        if (work.frac > 0) {
+            cpy3(camera_pos, work.endpos);
+        }
+
+        /* if nothing blocked us we are done */
+        if (work.frac == 1) {
+            break;
+        }
+
+        time_left -= time_left * work.frac;
+
+        if (n_planes >= MAX_CLIP_PLANES) {
+            clr3(velocity);
+            return 1;
+        }
+
+        /*
+         * if it's a plane we hit before, nudge velocity along it
+         * to prevent epsilon issues and dont re-test it
+         */
+
+        for (i = 0; i < n_planes; ++i)
+        {
+            if (dot3(work.plane->normal, planes[i]) > 0.99) {
+                add3(velocity, work.plane->normal);
+                break;
+            }
+        }
+
+        if (i < n_planes) {
+            continue;
+        }
+
+        /*
+         * entirely new plane, add it and clip velocity against all
+         * planes that the move interacts with
+         */
+
+        cpy3(planes[n_planes], work.plane->normal);
+        ++n_planes;
+
+        for (i = 0; i < n_planes; ++i)
+        {
+            float clipped[3];
+            float end_clipped[3];
+            int j;
+
+            if (dot3(velocity, planes[i]) >= 0.1) {
+                continue;
+            }
+
+            clip_velocity(velocity, planes[i], clipped, OVERCLIP);
+            clip_velocity(end_velocity, planes[i], end_clipped, OVERCLIP);
+
+            /*
+             * if the clipped move still hits another plane, slide along
+             * the line where the two planes meet (cross product) with the
+             * un-clipped velocity
+             *
+             * TODO: reduce nesting in here
+             */
+
+            for (j = 0; j < n_planes; ++j)
+            {
+                int k;
+                float dir[3];
+                float speed;
+
+                if (j == i) {
+                    continue;
+                }
+
+                if (dot3(clipped, planes[j]) >= 0.1) {
+                    continue;
+                }
+
+                clip_velocity(clipped, planes[j], clipped, OVERCLIP);
+                clip_velocity(end_clipped, planes[j], end_clipped,
+                    OVERCLIP);
+
+                if (dot3(clipped, planes[i]) >= 0) {
+                    /* goes back into the first plane */
+                    continue;
+                }
+
+                cross3(planes[i], planes[j], dir);
+                nrm3(dir);
+
+                speed = dot3(dir, velocity);
+                cpy3(clipped, dir);
+                mul3_scalar(clipped, speed);
+
+                speed = dot3(dir, end_velocity);
+                cpy3(end_clipped, dir);
+                mul3_scalar(end_clipped, speed);
+
+                /* if we still hit a plane, just give up and dead stop */
+
+                for (k = 0; k < n_planes; ++k)
+                {
+                    if (k == j || k == i) {
+                        continue;
+                    }
+
+                    if (dot3(clipped, planes[k]) >= 0.1) {
+                        continue;
+                    }
+
+                    clr3(velocity);
+                    return 1;
+                }
+            }
+
+            /* resolved all collisions for this move */
+            cpy3(velocity, clipped);
+            cpy3(end_velocity, end_clipped);
+            break;
+        }
+    }
+
+    if (gravity) {
+        cpy3(velocity, end_velocity);
+    }
+
+    return n_bumps != 0;
+}
+
+void update()
+{
+    float amount[3];
+
+    update_fps();
+    trace_ground();
+    apply_inputs();
+
+    if (!noclip) {
+        slide((movement & MOVEMENT_JUMPING) != 0);
+    }
+
+    else
+    {
+        cpy3(amount, velocity);
+        mul3_scalar(amount, delta_time);
+        add3(camera_pos, amount);
+    }
+
+    movement &= ~MOVEMENT_JUMP_THIS_FRAME;
 }
 
 void render_mesh(struct bsp_face* face)
@@ -1839,7 +2270,7 @@ void render()
     glLoadMatrixf(quake_matrix);
     glRotatef(degrees(camera_angle[1]), 0, -1, 0);
     glRotatef(degrees(camera_angle[0]), 0, 0, 1);
-    glTranslatef(-camera_pos[0], -camera_pos[1], -camera_pos[2]);
+    glTranslatef(-camera_pos[0], -camera_pos[1], -camera_pos[2] - 30);
 
     for (i = 0; i < n_visible_faces; ++i)
     {
@@ -1892,28 +2323,33 @@ void handle(SDL_Event* e)
         break;
 
     case SDL_KEYDOWN:
+        if (e->key.repeat) {
+            break;
+        }
+
         switch (e->key.keysym.sym)
         {
         case SDLK_ESCAPE:
             running = 0;
             break;
         case SDLK_w:
-            wishdir[0] = 1;
+            wishdir[0] = cl_forwardspeed;
             break;
         case SDLK_s:
-            wishdir[0] = -1;
+            wishdir[0] = -cl_forwardspeed;
             break;
         case SDLK_a:
-            wishdir[1] = 1;
+            wishdir[1] = cl_sidespeed;
             break;
         case SDLK_d:
-            wishdir[1] = -1;
+            wishdir[1] = -cl_sidespeed;
             break;
-        case SDLK_KP_PLUS:
-            wishdir[2] = 1;
+        case SDLK_f:
+            noclip ^= 1;
+            log_dump("d", noclip);
             break;
-        case SDLK_KP_MINUS:
-            wishdir[2] = -1;
+        case SDLK_SPACE:
+            movement |= MOVEMENT_JUMP;
             break;
         }
         break;
@@ -1936,12 +2372,21 @@ void handle(SDL_Event* e)
         case SDLK_d:
             wishdir[1] = 0;
             break;
-        case SDLK_KP_PLUS:
-            wishdir[2] = 0;
+        case SDLK_SPACE:
+            movement &= ~MOVEMENT_JUMP;
             break;
-        case SDLK_KP_MINUS:
-            wishdir[2] = 0;
-            break;
+        }
+        break;
+
+    case SDL_MOUSEBUTTONDOWN:
+        if (e->button.button == SDL_BUTTON_RIGHT) {
+            movement |= MOVEMENT_JUMP;
+        }
+        break;
+
+    case SDL_MOUSEBUTTONUP:
+        if (e->button.button == SDL_BUTTON_RIGHT) {
+            movement &= ~MOVEMENT_JUMP;
         }
         break;
     }
@@ -1967,7 +2412,9 @@ int main(int argc, char* argv[])
         delta_time = (ticks - prev_ticks) * 0.001f;
         prev_ticks = ticks;
 
+        SDL_GetRelativeMouseState(&wishlook[0], &wishlook[1]);
         for (; SDL_PollEvent(&e); handle(&e));
+
         tick();
     }
 
