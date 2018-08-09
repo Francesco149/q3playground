@@ -344,9 +344,13 @@ void gl_init()
 void gl_perspective(float horizontal_fov, float near, float far)
 {
     float aspect;
+    float vertical_fov;
+    float tan_half_fov;
 
     aspect = (float)gl_width / gl_height;
-    gluPerspective(horizontal_fov / aspect, aspect, near, far);
+    tan_half_fov = SDL_tanf(radians(horizontal_fov) * 0.5f);
+    vertical_fov = 2 * (float)SDL_atan(tan_half_fov / aspect);
+    gluPerspective(degrees(vertical_fov), aspect, near, far);
 }
 
 /* --------------------------------------------------------------------- */
