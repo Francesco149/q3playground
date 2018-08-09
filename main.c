@@ -1,6 +1,8 @@
 /*
  * quake 3 bsp renderer in c89 and opengl 1.x
  *
+ * ![](https://i.imgur.com/cLpZPiW.gif)
+ * ![](https://i.imgur.com/0gMLx0a.gif)
  * ![](https://i.imgur.com/Ig4hFPQ.gif)
  *
  * dependencies: libGL, libGLU, SDL2
