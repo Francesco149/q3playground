@@ -12,8 +12,11 @@ I might or might not add more features in the future, for now I have:
 * rendering meshes and patches
 * vertex lighting
 * collision detection with brushes (no patches aka curved surfaces yet)
+* cpm-like physics
+* sliding against bushes (no patches though)
 
-I want to at least implement physics and maybe collisions with patches
+the current priority is getting patches collisions and implement steps
+so we can actually walk up stairs
 
 # compiling
 just run ```./build``` . it's aware of ```CC```, ```CFLAGS```,
@@ -36,7 +39,7 @@ on *nix you might want to disable vsync by running it like
 env vblank_mode=0 q3playground /path/to/map.bsp
 ```
 
-controls are WASD, mouse, numpad +/-
+controls are WASD, space, mouse, right click. toggle noclip with F
 
 run ```q3playground``` with no arguments for more info
 
